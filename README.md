@@ -31,7 +31,7 @@ Measured: `homenet init` took a fresh Debian box to a working setup in 1m03.8s; 
 - SSH key access as root to the Pi-hole and Caddy hosts, or run homenet as root on the machine that has them.
 - On the machine running homenet: Python 3.11+, `dig` and `curl`.
 
-Don't have Pi-hole or Caddy yet? `homenet init` can install them on a Debian or Ubuntu host (it asks first).
+Don't have Pi-hole or Caddy yet? `homenet init` can install them on a Debian host (it asks first). The check also accepts Ubuntu and other Debian derivatives, but only Debian 13 was tested.
 
 ## Install
 
@@ -85,7 +85,7 @@ Bind your app to `0.0.0.0` or the default host's LAN address, not `127.0.0.1`, s
 
 - `list` sees Pi-hole `dns.hosts`, `/etc/dnsmasq.d/*.conf` and the Caddyfile's sites. A name defined anywhere else is invisible to it.
 - One Pi-hole and one Caddy. Backends are IPv4 `ip:port`.
-- `init` installs only on Debian or Ubuntu. Caddy in Docker must already be running.
+- `init` installs only on Debian-family systems; only Debian 13 was tested. Caddy in Docker must already be running.
 - Tested with Caddy in Docker inside a Proxmox container reached via `ssh ... pct exec`, and with Debian's Caddy package plus Pi-hole v6 on Debian 13 (installed by hand and by `init`), reached locally and over `ssh root@`.
 
 To get the green padlock, trust Caddy's internal root CA on each client: copy `/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt` (in Docker: `/data/caddy/pki/authorities/local/root.crt`) from the Caddy host and add it to the device's trusted certificates.
