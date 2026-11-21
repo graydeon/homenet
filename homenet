@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""homenet: register https://<name>{zone} for an app, deterministically.
+
+The live hosts are the only source of truth: Caddy and Pi-hole v6.
+Every write is compare-and-set under a lock, validated before it lands, and
+convergent: running the same `add` or `rm` twice changes nothing the second time.
+
+  homenet init                   detect or install Pi-hole and Caddy, write the config
+  homenet list [--json]          every name on the network and where it points
+  homenet check NAME             exit 0 if free, 1 if taken
+  homenet port                   next free app port on the default host
+  homenet add NAME BACKEND       BACKEND is ip:port, or a bare port on the default host
+  homenet rm NAME                remove a name homenet added
+  homenet verify NAME            DNS + proxy + backend check
+
+Config: {config}
+"""
+import argparse, hashlib, json, os, re, shlex, subprocess, sys, tomllib
+
+CONFIG = os.path.expanduser("~/.config/homenet/config.toml")
+ZONE = ".home.arpa"
+LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+DNS_NAME = re.compile(rf"{LABEL}(?:\.{LABEL})*")
+CONFLICT = 75
+DEFAULT_HOST = APP_PORTS = OPEN_PORTS = PIHOLE = CADDY = None
+
+LOCKED = 'exec 9>/run/homenet.lock; flock -w 60 9 || { echo "lock busy" >&2; exit 1; }\n'
+BACKUP = ('mkdir -p /root/homenet-backups && cp -p "$F" "/root/homenet-backups/$(basename "$F").$(date -u +%Y%m%dT%H%M%SZ)"\n'
+          'ls -1t /root/homenet-backups/"$(basename "$F")".* | tail -n +31 | xargs -r rm -f\n')
+
+# $1 Caddyfile, $2 Docker container or empty, $3 sha256 of the file we read, $4 new contents
+CADDY_APPLY = 'set -e\nF=$1\n' + LOCKED + r'''
+C=$2; if [ -n "$C" ]; then caddy() { docker exec -i "$C" caddy "$@"; }; conf=/etc/caddy/Caddyfile; else conf=$F; fi
+new=$(mktemp); trap 'rm -f "$new" "$new.err"' EXIT; printf %s "$4" > "$new"
+[ "$(sha256sum < "$F" | cut -d' ' -f1)" = "$3" ] || { echo "Caddyfile changed underneath us" >&2; exit 75; }
+caddy validate --adapter caddyfile --config /dev/stdin < "$new" >/dev/null 2>"$new.err" \
+  || { grep -v '"level":"info"\|"level":"warn"' "$new.err" >&2; exit 65; }
+''' + BACKUP + r'''
+prev=$(ls -1t /root/homenet-backups/"$(basename "$F")".* | head -1)
+cat "$new" > "$F"   # in place: a container may bind-mount this inode
+if ! caddy reload --config "$conf" </dev/null >/dev/null 2>&1; then
+  cat "$prev" > "$F"; caddy reload --config "$conf" </dev/null >/dev/null 2>&1 || true
+  echo "caddy reload failed; previous Caddyfile restored" >&2; exit 1
+fi
+'''
+
+DNS_APPLY = 'set -e\nF=/etc/pihole/pihole.toml\n' + LOCKED + r'''
+[ "$(pihole-FTL --config dns.hosts)" = "$1" ] || { echo "dns.hosts changed underneath us" >&2; exit 75; }
+''' + BACKUP + r'''
+pihole-FTL --config dns.hosts "$2" >/dev/null
+'''
+
+DNS_READ = ("pihole-FTL --config dns.hosts; echo '#homenet-dnsmasq'; "
+            "cat /etc/dnsmasq.d/*.conf 2>/dev/null; true")
+
+DEBIAN = '. /etc/os-release; case "$ID $ID_LIKE" in *debian*) ;; *) echo "only Debian or Ubuntu installs are automated" >&2; exit 1;; esac\n'
+# The v6 installer keeps a pihole.toml that already exists, so the web UI port is set before it runs.
+PIHOLE_INSTALL = DEBIAN + r'''set -e; export DEBIAN_FRONTEND=noninteractive
+apt-get update -q && apt-get install -yq curl
+mkdir -p /etc/pihole
+[ -e /etc/pihole/pihole.toml ] || printf '[dns]\nupstreams = ["1.1.1.1", "9.9.9.9"]\n[webserver]\nport = "WEBPORT"\n' > /etc/pihole/pihole.toml
+curl -fsSL https://install.pi-hole.net -o /tmp/pihole-install.sh
+bash /tmp/pihole-install.sh --unattended </dev/null
+'''
+CADDY_INSTALL = DEBIAN + "export DEBIAN_FRONTEND=noninteractive; apt-get update -q && apt-get install -yq caddy\n"
+
+
+def die(msg, code=1):
+    print(f"homenet: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(host, script, *args):
+    """Run script as root through the host's `run` prefix. The script goes on stdin, so no quoting crosses ssh."""
+    body = "{\nset -- " + " ".join(map(shlex.quote, args)) + "\n" + script + "\n}\n"
+    return subprocess.run(shlex.split(host["run"]) + ["sh", "-s"], input=body, capture_output=True, text=True)
+
+
+def sh_ok(host, script, *args):
+    r = sh(host, script, *args)
+    if r.returncode == CONFLICT:
+        raise Conflict()
+    if r.returncode:
+        die(f"{host['name']}: {r.stderr.strip() or 'exit ' + str(r.returncode)}")
+    return r.stdout
+
+
+class Conflict(Exception):
+    pass
+
+
+def configure(c):
+    """Load a parsed config into the module globals. Raises KeyError/TypeError/ValueError if it is incomplete."""
+    global ZONE, DEFAULT_HOST, APP_PORTS, OPEN_PORTS, PIHOLE, CADDY
+    domain = str(c.get("domain", "home.arpa")).lower().strip(".")
+    if not DNS_NAME.fullmatch(domain):
+        raise ValueError(f"domain {domain!r} is not a valid DNS name")
+    lo, hi = c["app_ports"]
+    PIHOLE, CADDY = dict(c["pihole"], name="pihole"), dict(c["caddy"], name="caddy")
+    PIHOLE["ip"], PIHOLE["run"], CADDY["ip"], CADDY["run"], CADDY["caddyfile"]  # KeyError names a missing key
+    ZONE, DEFAULT_HOST, APP_PORTS = "." + domain, c["default_host"], range(lo, hi + 1)
+    OPEN_PORTS = set(APP_PORTS) | set(c["open_ports"]) if "open_ports" in c else None
+
+
+def load_config(path=CONFIG):
+    """Return an error message, or None once the config is loaded."""
+    hint = "see config.example.toml, or run `homenet init`"
+    try:
+        with open(path, "rb") as f:
+            configure(tomllib.load(f))
+    except FileNotFoundError:
+        return f"no config at {path}; {hint}"
+    except KeyError as e:
+        return f"{path} is missing {e}; {hint}"
+    except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError) as e:
+        return f"{path}: {e}; {hint}"
+
+
+# ---- parsing -----------------------------------------------------------------
+
+def norm_name(n):
+    n = n.strip().lower().rstrip(".")
+    if not n.endswith(ZONE):
+        n += ZONE
+    if not DNS_NAME.fullmatch(n):
+        die(f"bad name {n!r}: use lowercase letters, digits and hyphens")
+    return n
+
+
+def norm_backend(b):
+    if b.isdigit():
+        b = f"{DEFAULT_HOST}:{b}"
+    m = re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})", b)
+    if not m or not 0 < int(m.group(2)) < 65536:
+        die(f"bad backend {b!r}: use ip:port, or a bare port for the default host")
+    return b
+
+
+def parse_hosts(out):
+    """`pihole-FTL --config dns.hosts` prints [ a, b, c ]; entries never contain commas."""
+    s = out.strip()
+    if not (s.startswith("[") and s.endswith("]")):
+        die(f"unexpected dns.hosts output: {s[:80]!r}")
+    return [e.strip() for e in s[1:-1].split(",") if e.strip()]
+
+
+def parse_dns(out):
+    """Return (hosts list, {name: (ip, source)}, [wildcard address= domains])."""
+    hosts_out, _, dnsmasq = out.partition("#homenet-dnsmasq")
+    hosts = parse_hosts(hosts_out)
+    names, wild = {}, []
+    for e in hosts:
+        ip, *ns = e.split()
+        for n in ns:
+            names.setdefault(n, (ip, "pihole"))
+    for line in dnsmasq.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if m := re.fullmatch(r"address=/([^/]+)/(\S+)", line):
+            names.setdefault(m[1], (m[2], "dnsmasq"))
+            wild.append(m[1])
+        elif m := re.fullmatch(r"host-record=(.+)", line):
+            *ns, ip = m[1].split(",")
+            for n in ns:
+                names.setdefault(n.strip(), (ip.strip(), "dnsmasq"))
+        elif m := re.fullmatch(r"cname=([^,]+),(.+)", line):
+            names.setdefault(m[1].strip(), ("cname:" + m[2].strip(), "dnsmasq"))
+    return hosts, names, wild
+
+
+def parse_caddy(text):
+    """Return {name: {"backend": first upstream or None, "managed": bool}} for sites in the zone."""
+    sites, managed, depth, cur = {}, set(), 0, []
+    for line in text.splitlines():
+        if m := re.match(r"\s*# homenet:begin (\S+)", line):
+            managed.add(m[1])
+        code = re.sub(r"(^|\s)#.*", "", line).strip()
+        if depth == 0 and code.endswith("{"):
+            cur = [a.strip().split("://")[-1].rsplit(":", 1)[0] for a in code[:-1].split(",")]
+            cur = [a for a in cur if a.endswith(ZONE)]
+            for a in cur:
+                sites.setdefault(a, {"backend": None, "managed": False})
+        elif depth > 0 and code.startswith("reverse_proxy"):
+            ups = [t for t in code.split()[1:] if t[0] not in "/@*{"]
+            for a in cur:
+                if ups and sites[a]["backend"] is None:
+                    sites[a]["backend"] = ups[0]
+        depth += code.count("{") - code.count("}")
+        if depth <= 0:
+            depth, cur = 0, []
+    for n in managed & sites.keys():
+        sites[n]["managed"] = True
+    return sites
+
+
+def block(name, backend):
+    return (f"# homenet:begin {name}\n{name} {{\n\ttls internal\n\treverse_proxy {backend}\n}}\n"
+            f"# homenet:end {name}\n")
+
+
+def block_re(name):
+    return re.compile(rf"\n?# homenet:begin {re.escape(name)}\n.*?# homenet:end {re.escape(name)}\n", re.S)
+
+
+# ---- live state --------------------------------------------------------------
+
+def load():
+    caddy = sh_ok(CADDY, 'cat "$1"', CADDY["caddyfile"])
+    dns_raw = sh_ok(PIHOLE, DNS_READ)
+    hosts, dns, wild = parse_dns(dns_raw)
+    return caddy, hosts, dns, wild, parse_caddy(caddy)
+
+
+def rows(dns, sites):
+    out = []
+    for n in sorted(set(dns) | set(sites), key=lambda n: n.split(".")[::-1]):
+        if not n.endswith(ZONE):
+            continue
+        ip, src = dns.get(n, (None, None))
+        s = sites.get(n, {})
+        out.append({"name": n, "dns": ip, "dns_source": src, "backend": s.get("backend"),
+                    "managed": s.get("managed", False)})
+    return out
+
+
+def taken_by(name, dns, wild, sites):
+    if name in dns:
+        return f"DNS {dns[name][0]} ({dns[name][1]})"
+    if name in sites:
+        return f"Caddy site -> {sites[name]['backend']}"
+    for w in wild:
+        if name.endswith("." + w):
+            return f"dnsmasq wildcard address=/{w}/"
+    return None
+
+
+# ---- commands ----------------------------------------------------------------
+
+def cmd_list(a):
+    _, _, dns, _, sites = load()
+    rs = rows(dns, sites)
+    if a.json:
+        print(json.dumps(rs, indent=1))
+        return
+    w = max((len(r["name"]) for r in rs), default=4)
+    print(f"{'NAME':<{w}}  {'DNS':<15}  {'BACKEND':<21}  MANAGED")
+    for r in rs:
+        print(f"{r['name']:<{w}}  {r['dns'] or '-':<15}  {r['backend'] or '-':<21}  {'yes' if r['managed'] else ''}")
+
+
+def cmd_check(a):
+    name = norm_name(a.name)
+    _, _, dns, wild, sites = load()
+    t = taken_by(name, dns, wild, sites)
+    print(f"{name}: taken by {t}" if t else f"{name}: free")
+    sys.exit(1 if t else 0)
+
+
+def local_ips():
+    return subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split()
+
+
+def used_ports(sites):
+    used = {int(s["backend"].rsplit(":", 1)[1]) for s in sites.values()
+            if s["backend"] and s["backend"].startswith(DEFAULT_HOST + ":")}
+    if DEFAULT_HOST in local_ips():
+        ss = subprocess.run(["ss", "-ltnH"], capture_output=True, text=True).stdout
+        used |= {int(l.split()[3].rsplit(":", 1)[1]) for l in ss.splitlines() if l.split()}
+    return used
+
+
+def cmd_port(a):
+    _, _, _, _, sites = load()
+    used = used_ports(sites)
+    free = next((p for p in APP_PORTS if p not in used), None)
+    if free is None:
+        die(f"no free port in {APP_PORTS.start}-{APP_PORTS.stop - 1}")
+    print(free)
+
+
+def apply_caddy(old, new):
+    sha = hashlib.sha256(old.encode()).hexdigest()
+    sh_ok(CADDY, CADDY_APPLY, CADDY["caddyfile"], CADDY.get("docker", ""), sha, new)
+
+
+def apply_dns(hosts, new_hosts):
+    cur = "[ " + ", ".join(hosts) + " ]" if hosts else "[]"  # what pihole-FTL prints
+    sh_ok(PIHOLE, DNS_APPLY, cur, json.dumps(new_hosts))
+
+
+def retry(fn):
+    for _ in range(5):
+        try:
+            return fn()
+        except Conflict:
+            continue
+    die("config kept changing under concurrent edits; try again")
+
+
+def cmd_add(a):
+    name, backend = norm_name(a.name), norm_backend(a.backend)
+    proxy = CADDY["ip"]
+
+    def go():
+        caddy, hosts, dns, wild, sites = load()
+        site = sites.get(name)
+        owner = taken_by(name, dns, wild, sites)
+        if owner and not (site and site["managed"]):
+            die(f"{name} is taken by {owner}; pick another name (homenet list)")
+        want = block(name, backend)
+        if site and site["managed"]:
+            m = block_re(name).search(caddy)
+            if m.group(0).strip("\n") != want.strip("\n"):
+                if not a.replace:
+                    die(f"{name} already points at {site['backend']}; pass --replace to repoint it")
+                apply_caddy(caddy, block_re(name).sub("\n" + want, caddy, count=1))
+                print(f"caddy: {name} repointed -> {backend}")
+            else:
+                print(f"caddy: {name} -> {backend} (unchanged)")
+        else:
+            apply_caddy(caddy, caddy.rstrip("\n") + "\n\n" + want)
+            print(f"caddy: {name} -> {backend} (added)")
+        entry = f"{proxy} {name}"
+        if entry in hosts:
+            print(f"dns:   {name} -> {proxy} (unchanged)")
+        else:
+            apply_dns(hosts, hosts + [entry])
+            print(f"dns:   {name} -> {proxy} (added)")
+
+    retry(go)
+    if OPEN_PORTS and backend.startswith(DEFAULT_HOST + ":") and int(backend.rsplit(":", 1)[1]) not in OPEN_PORTS:
+        print("warn:  port is outside app_ports and open_ports in the config, so the default host's firewall "
+              "may block Caddy; use `homenet port` for a port in range")
+    sys.exit(verify(name))
+
+
+def cmd_rm(a):
+    name = norm_name(a.name)
+
+    def go():
+        caddy, hosts, dns, wild, sites = load()
+        site = sites.get(name)
+        if not (site and site["managed"]):
+            # The Caddy marker is the proof homenet owns a name, so DNS goes first
+            # and the marker last: a half-finished rm is finished by running it again.
+            owner = taken_by(name, dns, wild, sites)
+            if owner:
+                die(f"{name} was not added by homenet ({owner}); remove it by hand")
+            print(f"{name}: absent")
+            return
+        entry = f"{CADDY['ip']} {name}"
+        if entry in hosts:
+            apply_dns(hosts, [h for h in hosts if h != entry])
+            print(f"dns:   {name} removed")
+        apply_caddy(caddy, block_re(name).sub("\n", caddy, count=1).rstrip("\n") + "\n")
+        print(f"caddy: {name} removed")
+
+    retry(go)
+
+
+def verify(name):
+    """0 = fully working, 1 = DNS or proxy broken, 3 = registered but backend unhealthy."""
+    proxy = CADDY["ip"]
+    dig = ["dig", "+short", "+time=2", "+tries=1", f"@{PIHOLE['ip']}", name]
+    got = subprocess.run(dig, capture_output=True, text=True).stdout.split()
+    for _ in range(10):  # FTL picks up pihole.toml changes asynchronously
+        if proxy in got:
+            break
+        subprocess.run(["sleep", "1"])
+        got = subprocess.run(dig, capture_output=True, text=True).stdout.split()
+    dns_ok = proxy in got
+    print(f"check: dns {name} -> {' '.join(got) or 'NXDOMAIN'} {'ok' if dns_ok else 'FAIL'}")
+    curl = ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10",
+            "--resolve", f"{name}:443:{proxy}", f"https://{name}/"]
+    r = subprocess.run(curl, capture_output=True, text=True)
+    tls = "trusted"
+    if r.returncode in (35, 60):  # CA not trusted on this client; the route can still be checked
+        tls = "untrusted CA on this client"
+        r = subprocess.run(curl[:1] + ["-k"] + curl[1:], capture_output=True, text=True)
+    code = r.stdout.strip() or "000"
+    if code == "000":
+        print(f"check: https {name} FAIL ({r.stderr.strip()})")
+        return 1
+    healthy = code[0] in "1234"
+    print(f"check: https {name} -> {code} (tls {tls}) {'ok' if healthy else 'backend not answering'}")
+    if not dns_ok:
+        return 1
+    return 0 if healthy else 3
+
+
+# ---- init --------------------------------------------------------------------
+
+def ask(prompt, default=""):
+    v = input(f"{prompt} [{default}]: " if default else f"{prompt}: ").strip() or default
+    return "" if v == "-" else v
+
+
+def install(host, what, script):
+    if not input(f"{what} is not on {host['ip']}. Install it now? [y/N]: ").strip().lower().startswith("y"):
+        die(f"install {what} on {host['ip']} yourself, then run `homenet init` again")
+    print(f"installing {what} on {host['ip']} (takes a few minutes)...")
+    r = sh(host, script)
+    if r.returncode:
+        die(f"installing {what} failed:\n{(r.stdout + r.stderr)[-2000:]}")
+
+
+def cmd_init(a):
+    if os.path.exists(CONFIG):
+        die(f"{CONFIG} already exists; edit it, or move it aside to start over")
+    print("Answer each question; Enter takes the [default], - means empty.")
+    here = local_ips()
+    run_for = lambda ip: "" if ip in here else f"ssh root@{ip}"
+    c = {"domain": ask("local domain (not .local, mDNS owns it)", "home.arpa")}
+    c["default_host"] = ask("IP of the machine your apps run on", here[0] if here else "")
+    c["app_ports"] = [int(p) for p in ask("port range for `homenet port`", "8000-8099").split("-")]
+    ip = ask("Pi-hole IP")
+    c["pihole"] = {"ip": ip, "run": ask("command that gives a root shell on the Pi-hole host (- = this machine)", run_for(ip))}
+    ip = ask("Caddy IP", ip)
+    c["caddy"] = {"ip": ip, "run": ask("command that gives a root shell on the Caddy host",
+                                        c["pihole"]["run"] if ip == c["pihole"]["ip"] else run_for(ip))}
+    docker = ask("Caddy Docker container name (- = Caddy installed on the host)", "-")
+    c["caddy"]["caddyfile"] = ask("Caddyfile path on the Caddy host", "/etc/caddy/Caddyfile")
+    if docker:
+        c["caddy"]["docker"] = docker
+    try:
+        configure(c)
+    except (KeyError, TypeError, ValueError) as e:
+        die(f"bad answer: {e}")
+
+    if sh(PIHOLE, "pihole-FTL --config dns.hosts").returncode:
+        port = "8081o" if CADDY["ip"] == PIHOLE["ip"] else "80o,443os,[::]:80o,[::]:443os"  # Caddy needs 80 and 443 on a shared host
+        install(PIHOLE, "Pi-hole v6", PIHOLE_INSTALL.replace("WEBPORT", port))
+    if docker:
+        if sh(CADDY, 'docker exec "$1" caddy version', docker).returncode:
+            die(f"no Caddy in Docker container {docker!r} on {CADDY['ip']}; start it, then run `homenet init` again")
+    elif sh(CADDY, "command -v caddy").returncode:
+        install(CADDY, "Caddy", CADDY_INSTALL)
+    if sh(CADDY, 'test -f "$1"', CADDY["caddyfile"]).returncode:
+        die(f"no Caddyfile at {CADDY['caddyfile']} on {CADDY['ip']}")
+    load()
+
+    q = json.dumps
+    hosts = "".join(f"\n[{h}]\n" + "".join(f"{k} = {q(v)}\n" for k, v in c[h].items()) for h in ("pihole", "caddy"))
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        f.write(f"domain = {q(c['domain'])}\ndefault_host = {q(c['default_host'])}\n"
+                f"app_ports = {q(c['app_ports'])}\n{hosts}")
+    print(f"wrote {CONFIG}\nPi-hole and Caddy answer. Point your router's DNS at {PIHOLE['ip']}, "
+          f"then: homenet add NAME PORT")
+
+
+def main():
+    err = load_config()
+    p = argparse.ArgumentParser(prog="homenet", description=__doc__.format(zone=ZONE, config=CONFIG),
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("init"); s.set_defaults(f=cmd_init)
+    s = sub.add_parser("list"); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_list)
+    s = sub.add_parser("check"); s.add_argument("name"); s.set_defaults(f=cmd_check)
+    s = sub.add_parser("port"); s.set_defaults(f=cmd_port)
+    s = sub.add_parser("add"); s.add_argument("name"); s.add_argument("backend")
+    s.add_argument("--replace", action="store_true", help="repoint a homenet name at a new backend")
+    s.set_defaults(f=cmd_add)
+    s = sub.add_parser("rm"); s.add_argument("name"); s.set_defaults(f=cmd_rm)
+    s = sub.add_parser("verify"); s.add_argument("name")
+    s.set_defaults(f=lambda a: sys.exit(verify(norm_name(a.name))))
+    a = p.parse_args()
+    if err and a.f is not cmd_init:
+        die(err)
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()
